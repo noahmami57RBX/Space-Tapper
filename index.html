@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Space Tapper</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Space Tapper">
+<meta name="theme-color" content="#050514">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: #050514;
+    touch-action: manipulation;
+  }
+  #game {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  const SAVE_KEY = 'spacetapper-save-v1';
+  const TOTAL_LEVELS = 20;
+  const PLANET_COLORS = ['#ff6b6b', '#ffd93d', '#6bcb77', '#4d96ff', '#c77dff', '#ff9f1c'];
+
+  let W, H, dpr;
+  let bgStars = [];
+  let objects = [];
+  let popups = [];
+  let buttons = [];        // menu/HUD buttons, rebuilt every draw
+  let score = 0;
+  let lives = 3;
+  let timeLeft = 0;
+  let misses = 0;          // missed scorable objects since last life loss
+  let level = 1;
+  let state = 'start';     // 'start' | 'select' | 'playing' | 'paused' | 'complete' | 'failed'
+  let endScore = 0;
+  let newBest = false;
+  let lastTime = 0;
+  let spawnTimer = 0;
+
+  // ---------- Save data ----------
+  function loadSave() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SAVE_KEY));
+      if (s && s.unlocked) return s;
+    } catch (e) {}
+    return { unlocked: 1, best: {} };
+  }
+  function persist() {
+    try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {}
+  }
+  let save = loadSave();
+
+  // ---------- Level configuration ----------
+  function levelConfig(n) {
+    const tier = Math.min(3, Math.floor((n - 1) / 5)); // 0..3
+    const durations = [45, 35, 30, 25];
+    const mixes = [
+      { star: 0.80, planet: 0.15, gold: 0.00, asteroid: 0.05 }, // levels 1-5
+      { star: 0.55, planet: 0.30, gold: 0.02, asteroid: 0.13 }, // levels 6-10
+      { star: 0.45, planet: 0.25, gold: 0.03, asteroid: 0.27 }, // levels 11-15
+      { star: 0.40, planet: 0.22, gold: 0.08, asteroid: 0.30 }  // levels 16-20
+    ];
+    return {
+      duration: durations[tier],
+      speed: 40 + n * 8,                                    // px per second
+      spawnInterval: Math.max(0.32, 0.95 - n * 0.028),      // seconds between spawns
+      mix: mixes[tier],
+      goal: 10 + n * 5
+    };
+  }
+
+  // ---------- Sound (Web Audio, no files) ----------
+  let audioCtx = null;
+  function ensureAudio() {
+    if (!audioCtx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function beep(freq, dur, type, vol, delay) {
+    if (!audioCtx) return;
+    const t0 = audioCtx.currentTime + (delay || 0);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, t0);
+    gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+  }
+  function sTap()   { beep(620, 0.09, 'square', 0.12); }
+  function sGold()  { beep(880, 0.09, 'square', 0.14); beep(1320, 0.14, 'square', 0.14, 0.08); }
+  function sBad()   { beep(150, 0.28, 'sawtooth', 0.18); }
+  function sLife()  { beep(240, 0.25, 'triangle', 0.18); }
+  function sWin()   { [523, 659, 784, 1047].forEach((f, i) => beep(f, 0.16, 'square', 0.14, i * 0.12)); }
+  function sFail()  { beep(330, 0.2, 'sawtooth', 0.14); beep(220, 0.35, 'sawtooth', 0.14, 0.18); }
+
+  // ---------- Layout helpers ----------
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * dpr;
+    canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    makeBgStars();
+  }
+
+  function makeBgStars() {
+    bgStars = [];
+    const count = Math.floor((W * H) / 9000);
+    for (let i = 0; i < count; i++) {
+      bgStars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.5 + 0.4,
+        tw: Math.random() * Math.PI * 2,
+        twSpeed: Math.random() * 2 + 0.5
+      });
+    }
+  }
+
+  function roundedButton(x, y, w, h, label, action, color) {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, h / 2);
+    ctx.fillStyle = color || '#4d96ff';
+    ctx.shadowColor = color || '#4d96ff';
+    ctx.shadowBlur = 16;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.font = 'bold 24px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x + w / 2, y + h / 2 + 8);
+    buttons.push({ x, y, w, h, action });
+  }
+
+  function pauseButtonRect() {
+    return { x: W - 64, y: 16, w: 48, h: 48 };
+  }
+
+  // ---------- Game objects ----------
+  function pickKind(cfg) {
+    const r = Math.random();
+    const m = cfg.mix;
+    if (r < m.star) return 'star';
+    if (r < m.star + m.planet) return 'planet';
+    if (r < m.star + m.planet + m.gold) return 'gold';
+    return 'asteroid';
+  }
+
+  function spawnObject(cfg) {
+    const kind = pickKind(cfg);
+    const size = kind === 'gold' ? 30 : kind === 'planet' ? 26 + Math.random() * 16
+               : kind === 'asteroid' ? 24 + Math.random() * 14 : 20 + Math.random() * 8;
+    objects.push({
+      kind,
+      x: size + Math.random() * (W - size * 2),
+      y: -size,
+      r: size,
+      vy: cfg.speed * (0.85 + Math.random() * 0.4),
+      wobble: Math.random() * Math.PI * 2,
+      wobbleSpeed: Math.random() * 2 + 1,
+      color: PLANET_COLORS[Math.floor(Math.random() * PLANET_COLORS.length)],
+      rotation: Math.random() * Math.PI * 2,
+      spin: (Math.random() - 0.5) * 2
+    });
+  }
+
+  function drawStarShape(x, y, r, spikes, inner, color, glow) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.beginPath();
+    for (let i = 0; i < spikes * 2; i++) {
+      const radius = i % 2 === 0 ? r : r * inner;
+      const a = (i / (spikes * 2)) * Math.PI * 2 - Math.PI / 2;
+      ctx.lineTo(Math.cos(a) * radius, Math.sin(a) * radius);
+    }
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = glow || 12;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawPlanet(o) {
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.rotation);
+    const grad = ctx.createRadialGradient(-o.r * 0.3, -o.r * 0.3, o.r * 0.2, 0, 0, o.r);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.25, o.color);
+    grad.addColorStop(1, shade(o.color, -40));
+    ctx.beginPath();
+    ctx.arc(0, 0, o.r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.shadowColor = o.color;
+    ctx.shadowBlur = 15;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(0, 0, o.r * 1.5, o.r * 0.45, 0.4, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawAsteroid(o) {
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.rotation);
+    ctx.beginPath();
+    // lumpy rock silhouette
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      const rr = o.r * (0.75 + 0.25 * Math.sin(i * 2.7 + 1));
+      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    const grad = ctx.createRadialGradient(-o.r * 0.3, -o.r * 0.3, o.r * 0.2, 0, 0, o.r);
+    grad.addColorStop(0, '#ff8a8a');
+    grad.addColorStop(0.4, '#e63946');
+    grad.addColorStop(1, '#8b0f1a');
+    ctx.fillStyle = grad;
+    ctx.shadowColor = '#ff2e2e';
+    ctx.shadowBlur = 16;
+    ctx.fill();
+    // craters
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.arc(-o.r * 0.3, -o.r * 0.1, o.r * 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(o.r * 0.25, o.r * 0.3, o.r * 0.14, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function shade(hex, amt) {
+    const n = parseInt(hex.slice(1), 16);
+    const r = Math.max(0, Math.min(255, (n >> 16) + amt));
+    const g = Math.max(0, Math.min(255, ((n >> 8) & 0xff) + amt));
+    const b = Math.max(0, Math.min(255, (n & 0xff) + amt));
+    return `rgb(${r},${g},${b})`;
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    for (const s of bgStars) s.tw += s.twSpeed * dt;
+    for (const p of popups) { p.y -= 50 * dt; p.life -= dt; }
+    popups = popups.filter(p => p.life > 0);
+
+    if (state !== 'playing') return;
+
+    const cfg = levelConfig(level);
+    timeLeft -= dt;
+    if (timeLeft <= 0) { timeLeft = 0; endLevel(score >= cfg.goal); return; }
+
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawnObject(cfg); spawnTimer = cfg.spawnInterval * (0.7 + Math.random() * 0.6); }
+
+    for (const o of objects) {
+      o.y += o.vy * dt;
+      o.wobble += o.wobbleSpeed * dt;
+      o.x += Math.sin(o.wobble) * 12 * dt;
+      o.rotation += o.spin * dt;
+    }
+    // missed scorable objects cost a life for every 4 that get away
+    const survivors = [];
+    for (const o of objects) {
+      if (o.y - o.r >= H && o.kind !== 'asteroid') {
+        misses++;
+        if (misses >= 4) { misses = 0; loseLife(true); }
+      } else if (o.y - o.r < H) {
+        survivors.push(o);
+      }
+    }
+    objects = survivors;
+  }
+
+  function loseLife(withSound) {
+    lives--;
+    if (withSound !== false) sLife();
+    if (lives <= 0) { lives = 0; endLevel(false); }
+  }
+
+  function endLevel(completed) {
+    endScore = score;
+    newBest = score > (save.best[level] || 0);
+    if (score > (save.best[level] || 0)) { save.best[level] = score; }
+    if (completed && level < TOTAL_LEVELS) {
+      save.unlocked = Math.max(save.unlocked, level + 1);
+    }
+    persist();
+    if (completed) sWin(); else sFail();
+    state = completed ? 'complete' : 'failed';
+  }
+
+  // ---------- Draw ----------
+  function draw() {
+    buttons = [];
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#050514');
+    bg.addColorStop(1, '#141432');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    for (const s of bgStars) {
+      ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(s.tw));
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    for (const o of objects) {
+      if (o.kind === 'star') drawStarShape(o.x, o.y, o.r, 5, 0.5, '#ffe066');
+      else if (o.kind === 'gold') drawStarShape(o.x, o.y, o.r, 6, 0.55, '#ffb703', 25);
+      else if (o.kind === 'planet') drawPlanet(o);
+      else drawAsteroid(o);
+    }
+
+    ctx.textAlign = 'center';
+    for (const p of popups) {
+      ctx.globalAlpha = Math.min(1, p.life * 2);
+      ctx.font = 'bold 24px system-ui, sans-serif';
+      ctx.fillStyle = p.color || '#ffffff';
+      ctx.fillText(p.text, p.x, p.y);
+    }
+    ctx.globalAlpha = 1;
+
+    if (state === 'start') drawStart();
+    else if (state === 'select') drawSelect();
+    else { drawHud(); if (state === 'paused') drawPaused(); else if (state === 'complete') drawEnd(true); else if (state === 'failed') drawEnd(false); }
+  }
+
+  function drawHud() {
+    const cfg = levelConfig(level);
+    // lives
+    ctx.textAlign = 'left';
+    ctx.font = '20px system-ui, sans-serif';
+    let hearts = '';
+    for (let i = 0; i < 3; i++) hearts += i < lives ? '❤️' : '🖤';
+    ctx.fillText(hearts, 16, 40);
+
+    // score / goal
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 34px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = '#4d96ff';
+    ctx.shadowBlur = 10;
+    ctx.fillText(score + ' / ' + cfg.goal, W / 2, 44);
+    ctx.shadowBlur = 0;
+
+    // timer under score
+    ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText(Math.ceil(timeLeft) + 's · Level ' + level, W / 2, 70);
+
+    // goal progress bar
+    const barW = Math.min(240, W - 120), barH = 8;
+    const bx = W / 2 - barW / 2;
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.beginPath(); ctx.roundRect(bx, 80, barW, barH, 4); ctx.fill();
+    ctx.fillStyle = '#6bcb77';
+    ctx.beginPath(); ctx.roundRect(bx, 80, barW * Math.min(1, score / cfg.goal), barH, 4); ctx.fill();
+
+    // pause button
+    const p = pauseButtonRect();
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.beginPath(); ctx.roundRect(p.x, p.y, p.w, p.h, 12); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(p.x + 14, p.y + 14, 7, 20);
+    ctx.fillRect(p.x + 27, p.y + 14, 7, 20);
+    buttons.push({ ...p, action: pauseGame });
+  }
+
+  function overlayDim() {
+    ctx.fillStyle = 'rgba(5,5,20,0.75)';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function title(text, y, color) {
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 40px system-ui, sans-serif';
+    ctx.fillStyle = color || '#ffd93d';
+    ctx.shadowColor = color || '#ffd93d';
+    ctx.shadowBlur = 18;
+    ctx.fillText(text, W / 2, y);
+    ctx.shadowBlur = 0;
+  }
+
+  function drawStart() {
+    title('SPACE TAPPER', H * 0.3);
+    ctx.textAlign = 'center';
+    ctx.font = '17px system-ui, sans-serif';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('Tap stars & planets · avoid red asteroids!', W / 2, H * 0.3 + 44);
+    ctx.font = '18px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(TOTAL_LEVELS + ' levels · ' + save.unlocked + ' unlocked', W / 2, H * 0.3 + 74);
+    const bw = 220, bh = 62;
+    roundedButton(W / 2 - bw / 2, H * 0.5, bw, bh, '▶ PLAY', showSelect);
+  }
+
+  function drawSelect() {
+    title('SELECT LEVEL', 70);
+    const cols = 4, pad = 12;
+    const cell = Math.min((W - pad * (cols + 1)) / cols, 92);
+    const rows = Math.ceil(TOTAL_LEVELS / cols);
+    const gridH = rows * (cell + pad);
+    const top = Math.max(110, H / 2 - gridH / 2);
+    for (let n = 1; n <= TOTAL_LEVELS; n++) {
+      const i = n - 1;
+      const cx = pad + (i % cols) * (cell + pad);
+      const cy = top + Math.floor(i / cols) * (cell + pad);
+      const unlocked = n <= save.unlocked;
+      ctx.beginPath();
+      ctx.roundRect(cx, cy, cell, cell, 14);
+      ctx.fillStyle = unlocked ? (save.best[n] ? 'rgba(107,203,119,0.35)' : 'rgba(77,150,255,0.35)') : 'rgba(255,255,255,0.08)';
+      ctx.fill();
+      ctx.textAlign = 'center';
+      if (unlocked) {
+        ctx.font = 'bold 26px system-ui, sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(n, cx + cell / 2, cy + cell / 2 + 4);
+        const best = save.best[n];
+        ctx.font = '12px system-ui, sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.fillText(best ? '★ ' + best : levelConfig(n).goal + ' pts', cx + cell / 2, cy + cell - 10);
+        buttons.push({ x: cx, y: cy, w: cell, h: cell, action: () => startLevel(n) });
+      } else {
+        ctx.font = '24px system-ui, sans-serif';
+        ctx.fillText('🔒', cx + cell / 2, cy + cell / 2 + 8);
+      }
+    }
+    const bw = 160, bh = 50;
+    roundedButton(W / 2 - bw / 2, top + gridH + pad, bw, bh, '‹ BACK', () => { state = 'start'; }, 'rgba(255,255,255,0.2)');
+  }
+
+  function drawPaused() {
+    overlayDim();
+    title('PAUSED', H * 0.35, '#4d96ff');
+    const bw = 220, bh = 58;
+    roundedButton(W / 2 - bw / 2, H * 0.45, bw, bh, '▶ RESUME', resumeGame, '#6bcb77');
+    roundedButton(W / 2 - bw / 2, H * 0.45 + bh + 16, bw, bh, 'QUIT', () => { state = 'select'; }, 'rgba(255,255,255,0.2)');
+  }
+
+  function drawEnd(completed) {
+    overlayDim();
+    const cfg = levelConfig(level);
+    if (completed) {
+      title('LEVEL ' + level + ' COMPLETE!', H * 0.28, '#6bcb77');
+      if (level < TOTAL_LEVELS) {
+        ctx.font = '20px system-ui, sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Level ' + (level + 1) + ' unlocked!', W / 2, H * 0.28 + 36);
+      }
+    } else {
+      title(lives <= 0 ? 'OUT OF LIVES!' : 'TIME’S UP!', H * 0.28, '#ff6b6b');
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('Goal was ' + cfg.goal + ' points', W / 2, H * 0.28 + 36);
+    }
+    ctx.font = 'bold 30px system-ui, sans-serif';
+    ctx.fillStyle = '#ffd93d';
+    ctx.fillText('Score: ' + endScore, W / 2, H * 0.40);
+    if (newBest) {
+      ctx.font = 'bold 20px system-ui, sans-serif';
+      ctx.fillStyle = '#ffb703';
+      ctx.fillText('🏆 NEW BEST!', W / 2, H * 0.40 + 34);
+    }
+    const bw = 240, bh = 54, gap = 12;
+    let y = H * 0.50;
+    if (completed && level < TOTAL_LEVELS) {
+      roundedButton(W / 2 - bw / 2, y, bw, bh, 'NEXT LEVEL ›', () => startLevel(level + 1), '#6bcb77');
+      y += bh + gap;
+    }
+    if (!completed) {
+      roundedButton(W / 2 - bw / 2, y, bw, bh, '↻ TRY AGAIN', () => startLevel(level), '#ff9f1c');
+      y += bh + gap;
+    }
+    roundedButton(W / 2 - bw / 2, y, bw, bh, '↻ PLAY AGAIN', () => startLevel(level), '#4d96ff');
+    y += bh + gap;
+    roundedButton(W / 2 - bw / 2, y, bw, bh, 'LEVELS', () => { state = 'select'; }, 'rgba(255,255,255,0.2)');
+  }
+
+  // ---------- Input ----------
+  function handleTap(x, y) {
+    ensureAudio();
+    // menu / HUD buttons first
+    for (const b of buttons) {
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+        sTap();
+        b.action();
+        return;
+      }
+    }
+    if (state !== 'playing') return;
+
+    // hit test objects, topmost first
+    for (let i = objects.length - 1; i >= 0; i--) {
+      const o = objects[i];
+      const dx = x - o.x, dy = y - o.y;
+      if (dx * dx + dy * dy <= (o.r + 12) * (o.r + 12)) {
+        objects.splice(i, 1);
+        if (o.kind === 'asteroid') {
+          score = Math.max(0, score - 1);
+          popups.push({ x: o.x, y: o.y, text: '-1', color: '#ff6b6b', life: 0.8 });
+          sBad();
+          loseLife(true);
+        } else {
+          const pts = o.kind === 'gold' ? 5 : o.kind === 'planet' ? 2 : 1;
+          score += pts;
+          popups.push({ x: o.x, y: o.y, text: '+' + pts, color: o.kind === 'gold' ? '#ffb703' : '#ffffff', life: 0.8 });
+          if (o.kind === 'gold') sGold(); else sTap();
+          if (score >= levelConfig(level).goal) { endLevel(true); }
+        }
+        return;
+      }
+    }
+  }
+
+  // ---------- Flow ----------
+  function startLevel(n) {
+    level = n;
+    score = 0;
+    lives = 3;
+    misses = 0;
+    timeLeft = levelConfig(n).duration;
+    objects = [];
+    popups = [];
+    spawnTimer = 0.4;
+    state = 'playing';
+  }
+  function pauseGame() { if (state === 'playing') state = 'paused'; }
+  function resumeGame() { if (state === 'paused') state = 'playing'; }
+  function showSelect() { state = 'select'; }
+
+  function loop(t) {
+    if (!lastTime) lastTime = t;
+    const dt = Math.min(0.05, (t - lastTime) / 1000);
+    lastTime = t;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    handleTap(e.clientX, e.clientY);
+  });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
+
+  window.addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

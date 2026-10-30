@@ -1,0 +1,12 @@
+{
+  "name": "Space Tapper",
+  "short_name": "Space Tapper",
+  "start_url": ".",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#050514",
+  "theme_color": "#050514",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
